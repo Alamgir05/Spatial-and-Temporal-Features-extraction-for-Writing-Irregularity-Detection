@@ -1,0 +1,208 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Handwriting Collector + Live Irregularity Detection</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <style>
+    body { font-family: Arial, sans-serif; padding: 12px; }
+    #cv { border:1px solid #888; touch-action:none; background:white; display:block; margin-bottom:8px; }
+    .controls { margin-bottom:12px; }
+    #score { font-weight:700; margin-top:8px; }
+    #velCanvas { border:1px solid #ddd; width:600px; height:120px; display:block; margin-top:8px; }
+  </style>
+</head>
+<body>
+  <h3>Handwriting Collector + Live Irregularity Detection</h3>
+  <p>Connect your tablet, enter writer & sample ids, draw, then click <b>Send & Predict</b>.</p>
+
+  <canvas id="cv" width="900" height="300"></canvas>
+
+  <div class="controls">
+    <label>Mark sample as:</label>
+<button id="mark_normal">Normal (0)</button>
+<button id="mark_irregular">Irregular (1)</button>
+
+    <input id="writer" placeholder="writer_id (e.g. user1)" />
+    <input id="sample" placeholder="sample_id (e.g. s1)" />
+    <button id="clear">Clear</button>
+    <button id="send">Send & Predict</button>
+  </div>
+
+  <div id="status">Not sent yet.</div>
+  <div id="score"></div>
+  <canvas id="velCanvas" width="600" height="120"></canvas>
+
+<script>
+/* ====== CONFIG: change these if your servers are at different addresses ====== */
+const UPLOAD_URL = '/upload';                 // POST (same server that serves this page)
+const PREDICT_URL = 'http://127.0.0.1:8000/predict_json'; // inference server (must allow CORS)
+/* ========================================================================== */
+
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+let drawing = false;
+let curStroke = [];
+let strokes = []; // array of strokes (each stroke is array of points)
+const getT = () => Date.now()/1000.0; // seconds
+
+function pt(x,y,t,pressure,penDown){ return {x, y, t, pressure, penDown}; }
+function pressureFromEvent(evt){ if(!evt) return 0.5; return (evt.pressure !== undefined ? evt.pressure : 0.5); }
+
+function start(e){
+  e.preventDefault();
+  const r = cv.getBoundingClientRect();
+  drawing = true;
+  const p = pressureFromEvent(e);
+  curStroke = [ pt(e.clientX - r.left, e.clientY - r.top, getT(), p, true) ];
+}
+function move(e){
+  if(!drawing) return;
+  e.preventDefault();
+  const r = cv.getBoundingClientRect();
+  const p = pressureFromEvent(e);
+  curStroke.push( pt(e.clientX - r.left, e.clientY - r.top, getT(), p, true) );
+  redraw();
+}
+function end(e){
+  if(!drawing) return;
+  drawing = false;
+  if(curStroke.length) strokes.push(curStroke);
+  curStroke = [];
+  redraw();
+}
+
+function redraw(){
+  ctx.clearRect(0,0,cv.width,cv.height);
+  ctx.lineJoin='round'; ctx.lineCap='round'; ctx.lineWidth=2; ctx.strokeStyle='black';
+  strokes.concat([curStroke]).forEach(s=>{
+    if(s.length<1) return;
+    ctx.beginPath();
+    ctx.moveTo(s[0].x, s[0].y);
+    for(let i=1;i<s.length;i++) ctx.lineTo(s[i].x, s[i].y);
+    ctx.stroke();
+  });
+}
+
+cv.addEventListener('pointerdown', (e)=>start(e));
+cv.addEventListener('pointermove', (e)=>move(e));
+cv.addEventListener('pointerup',   (e)=>end(e));
+cv.addEventListener('pointerleave',(e)=>end(e));
+
+document.getElementById('clear').onclick = ()=>{ strokes=[]; curStroke=[]; redraw(); document.getElementById('status').innerText='Cleared'; document.getElementById('score').innerText=''; clearVelCanvas(); };
+
+function flattenPoints(strokes){
+  const rows = [];
+  for(let si=0; si<strokes.length; si++){
+    const s = strokes[si];
+    for(let pi=0; pi<s.length; pi++){
+      const p = s[pi];
+      rows.push(p);
+    }
+  }
+  return rows;
+}
+
+function computeVelocityArray(rows){ // simple velocity magnitudes from flattened points
+  if(rows.length < 2) return [];
+  const v = [];
+  for(let i=1;i<rows.length;i++){
+    const dx = rows[i].x - rows[i-1].x;
+    const dy = rows[i].y - rows[i-1].y;
+    const dt = Math.max(1e-6, rows[i].t - rows[i-1].t);
+    v.push(Math.sqrt(dx*dx + dy*dy) / dt);
+  }
+  return v;
+}
+
+function drawVelocity(velArray){
+  const c = document.getElementById('velCanvas');
+  const cc = c.getContext('2d');
+  cc.clearRect(0,0,c.width,c.height);
+  if(velArray.length==0) return;
+  const maxv = Math.max(...velArray);
+  const scale = (maxv > 0) ? (c.height / maxv) : 1;
+  cc.beginPath();
+  cc.moveTo(0, c.height - velArray[0]*scale);
+  for(let i=1;i<velArray.length;i++){
+    const x = Math.floor((i / (velArray.length-1)) * c.width);
+    const y = c.height - velArray[i]*scale;
+    cc.lineTo(x, y);
+  }
+  cc.strokeStyle = '#2b7cff'; cc.lineWidth=1.5; cc.stroke();
+}
+function clearVelCanvas(){ const c=document.getElementById('velCanvas'); c.getContext('2d').clearRect(0,0,c.width,c.height); }
+// helper: sample key used on server (writer__sample)
+function currentSampleKey() {
+  const writer = document.getElementById('writer').value || 'anonymous';
+  const sample = document.getElementById('sample').value || `s_${Date.now()}`;
+  return `${writer}__${sample}`;
+}
+
+// when user marks normal/irregular, add label to server
+document.getElementById('mark_normal').onclick = async ()=>{
+  const key = currentSampleKey();
+  try {
+    const r = await fetch('/label', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({sample_key: key, label: 0}) });
+    const j = await r.json();
+    alert('Label result: '+JSON.stringify(j));
+  } catch(err) { alert('Labeling failed: '+err); }
+};
+document.getElementById('mark_irregular').onclick = async ()=>{
+  const key = currentSampleKey();
+  try {
+    const r = await fetch('/label', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({sample_key: key, label: 1}) });
+    const j = await r.json();
+    alert('Label result: '+JSON.stringify(j));
+  } catch(err) { alert('Labeling failed: '+err); }
+};
+
+
+/* ====== Send & Predict Handler ====== */
+document.getElementById('send').onclick = async ()=>{
+  const writer = document.getElementById('writer').value || 'anonymous';
+  const sample = document.getElementById('sample').value || `s_${Date.now()}`;
+  if(strokes.length === 0){ alert('Draw something first'); return; }
+
+  const payload = { writer_id: writer, sample_id: sample, created: new Date().toISOString(), strokes: strokes };
+
+  // 1) save to collection server (same origin, /upload)
+  try {
+    const resp1 = await fetch(UPLOAD_URL, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(payload)
+    });
+    const r1 = await resp1.json().catch(()=>null);
+    document.getElementById('status').innerText = 'Saved: ' + (r1 && r1.file ? r1.file : (resp1.ok ? 'ok' : 'failed'));
+  } catch(err) {
+    console.warn('Upload failed:', err);
+    document.getElementById('status').innerText = 'Upload failed: ' + err;
+  }
+
+  // 2) call inference server to get irregularity score (may be cross-origin)
+  try {
+    const resp2 = await fetch(PREDICT_URL, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(payload)
+    });
+    const j = await resp2.json();
+    if(resp2.ok && j.irregularity_score !== undefined){
+      const s = j.irregularity_score;
+      document.getElementById('score').innerText = 'Irregularity score: ' + (s).toFixed(3) + '  (higher = more irregular)';
+      // draw velocity plot from sample to help debugging
+      const rows = flattenPoints(strokes);
+      const vel = computeVelocityArray(rows);
+      drawVelocity(vel);
+    } else {
+      document.getElementById('score').innerText = 'Predict server response: ' + JSON.stringify(j);
+    }
+  } catch(err) {
+    console.warn('Predict failed', err);
+    document.getElementById('score').innerText = 'Predict failed: ' + err;
+  }
+};
+</script>
+</body>
+</html>
